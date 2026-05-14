@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vision Voice Agent</title>
+    <style>
+        :root {
+            --bg-color: #f3f4f6;
+            --panel-bg: #ffffff;
+            --text-main: #1f2937;
+            --text-muted: #6b7280;
+            --border-color: #e5e7eb;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --success: #10b981;
+        }
+
+        * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        
+        body {
+            margin: 0; padding: 20px;
+            background-color: var(--bg-color); color: var(--text-main);
+            display: flex; flex-direction: column; align-items: center; min-height: 100vh;
+        }
+
+        .container {
+            display: grid; grid-template-columns: 1fr 1fr; gap: 20px;
+            max-width: 1200px; width: 100%;
+        }
+
+        .panel {
+            background-color: var(--panel-bg); border-radius: 12px;
+            padding: 20px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+            display: flex; flex-direction: column;
+        }
+
+        h2 { margin-top: 0; font-size: 1.25rem; border-bottom: 1px solid var(--border-color); padding-bottom: 10px; }
+
+        /* Video Section */
+        #video-container {
+            position: relative; width: 100%; aspect-ratio: 4/3;
+            background-color: #000; border-radius: 8px; overflow: hidden;
+            display: flex; align-items: center; justify-content: center;
+        }
+
+        video { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+
+        #emotion-badge {
+            position: absolute; bottom: 10px; right: 10px;
+            background: rgba(0,0,0,0.7); color: white;
+            padding: 6px 12px; border-radius: 20px; font-size: 0.875rem; font-weight: 500;
+            display: flex; align-items: center; gap: 6px;
+        }
+        
+        .indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; background-color: gray; }
+
+        /* Agent State */
+        .agent-header { display: flex; justify-content: space-between; align-items: center; }
+        #agent-state {
+            padding: 4px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: bold;
+            background-color: #e5e7eb; color: var(--text-muted); text-transform: uppercase;
+        }
+        #agent-state.listening { background-color: #d1fae5; color: #047857; }
+        #agent-state.thinking { background-color: #fef3c7; color: #b45309; }
+        #agent-state.speaking { background-color: #dbeafe; color: #1d4ed8; }
+
+        /* Transcript */
+        #transcript {
+            flex-grow: 1; min-height: 300px; max-height: 500px; overflow-y: auto;
+            border: 1px solid var(--border-color); border-radius: 8px; padding: 10px;
+            background-color: #f9fafb; display: flex; flex-direction: column; gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .message { padding: 10px 14px; border-radius: 12px; max-width: 85%; line-height: 1.4; font-size: 0.95rem; }
+        .message.user { align-self: flex-end; background-color: var(--primary); color: white; border-bottom-right-radius: 2px; }
+        .message.assistant { align-self: flex-start; background-color: white; border: 1px solid var(--border-color); border-bottom-left-radius: 2px; }
+
+        /* Controls */
+        #controls { display: flex; gap: 10px; margin-top: auto; }
+        button {
+            padding: 10px 16px; border: none; border-radius: 6px; font-weight: 600;
+            cursor: pointer; transition: background-color 0.2s; flex: 1;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary { background-color: var(--primary); color: white; }
+        .btn-primary:hover:not(:disabled) { background-color: var(--primary-hover); }
+        .btn-danger { background-color: var(--danger); color: white; }
+        .btn-danger:hover:not(:disabled) { background-color: var(--danger-hover); }
+
+        /* Status Bar */
+        #status-bar {
+            width: 100%; max-width: 1200px; margin-top: 20px; padding: 10px 20px;
+            background-color: var(--panel-bg); border-radius: 8px; font-size: 0.875rem;
+            display: flex; justify-content: space-between; color: var(--text-muted);
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .status-text.error { color: var(--danger); }
+        .status-text.success { color: var(--success); }
+
+        canvas { display: none; }
+        
+        @media (max-width: 768px) {
+            .container { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <!-- Left Panel: Vision & Controls -->
+        <div class="panel">
+            <h2>Vision Context</h2>
+            <div id="video-container">
+                <video id="webcam" autoplay playsinline muted></video>
+                <div id="emotion-badge">
+                    <span class="indicator" id="emotion-color"></span>
+                    <span id="emotion-text">Connecting...</span>
+                </div>
+            </div>
+            
+            <div style="margin-top: 20px;">
+                <p style="font-size: 0.875rem; color: var(--text-muted);">
+                    The agent analyzes your expression every 3 seconds and adapts its responses to your state.
+                </p>
+            </div>
+
+            <div id="controls">
+                <button id="btn-start" class="btn-primary" onclick="startSession()">Start Session</button>
+                <button id="btn-end" class="btn-danger" onclick="endSession()" disabled>End Session</button>
+            </div>
+        </div>
+
+        <!-- Right Panel: Audio & Transcript -->
+        <div class="panel">
+            <div class="agent-header">
+                <h2>Conversation</h2>
+                <div id="agent-state">IDLE</div>
+            </div>
+            
+            <div id="transcript">
+                <!-- Messages will appear here -->
+                <div style="text-align: center; color: var(--text-muted); margin-top: auto; margin-bottom: auto;">
+                    Start a session to begin speaking.
+                </div>
+            </div>
+            
+            <audio id="audio-player" style="display: none;"></audio>
+        </div>
+    </div>
+
+    <div id="status-bar">
+        <span id="status-msg" class="status-text">Ready</span>
+        <span>Turn: <span id="turn-count">0</span> | Session: <span id="session-id-display">None</span></span>
+    </div>
+
+    <!-- Hidden canvas for capturing frames -->
+    <canvas id="hidden-canvas"></canvas>
+
+    <script>
+        const API_BASE = "http://localhost:8000";
+        const WS_BASE = "ws://localhost:8000";
+
+        // State
+        let sessionId = null;
+        let ws = null;
+        
+        // Media streams
+        let videoStream = null;
+        let audioStream = null;
+        let audioContext = null;
+        let audioProcessor = null;
+        
+        // Intervals
+        let frameInterval = null;
+        let contextInterval = null;
+
+        // DOM Elements
+        const videoElement = document.getElementById('webcam');
+        const audioElement = document.getElementById('audio-player');
+        const canvasElement = document.getElementById('hidden-canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const transcriptDiv = document.getElementById('transcript');
+        const statusMsg = document.getElementById('status-msg');
+        
+        // Emotion Colors
+        const EMOTION_COLORS = {
+            "happy": "#10b981", "neutral": "#10b981",
+            "surprise": "#f59e0b",
+            "fear": "#ef4444", "angry": "#ef4444",
+            "sad": "#3b82f6",
+            "unknown": "#6b7280"
+        };
+
+        // --- Core Session Management ---
+
+        async function startSession() {
+            try {
+                updateStatus("Initializing session...", "info");
+                document.getElementById('btn-start').disabled = true;
+                
+                // 1. Create session on backend
+                const res = await fetch(`${API_BASE}/session/start`, { method: "POST" });
+                const data = await res.json();
+                sessionId = data.session_id;
+                document.getElementById('session-id-display').innerText = sessionId.substring(0, 8) + "...";
+                
+                // 2. Start hardware
+                await startWebcam();
+                await connectAudioWebSocket();
+                
+                // 3. Start polling
+                startFrameCapture();
+                startContextPolling();
+                
+                // Update UI
+                document.getElementById('btn-end').disabled = false;
+                transcriptDiv.innerHTML = "";
+                updateAgentState("LISTENING");
+                updateStatus("Session active. Speak into your microphone.", "success");
+                
+            } catch (err) {
+                console.error(err);
+                updateStatus("Failed to start session: " + err.message, "error");
+                document.getElementById('btn-start').disabled = false;
+            }
+        }
+
+        async function endSession() {
+            updateStatus("Ending session...", "info");
+            document.getElementById('btn-end').disabled = true;
+            
+            // Stop intervals
+            clearInterval(frameInterval);
+            clearInterval(contextInterval);
+            
+            // Stop hardware
+            if (videoStream) videoStream.getTracks().forEach(t => t.stop());
+            if (audioStream) audioStream.getTracks().forEach(t => t.stop());
+            if (audioContext) await audioContext.close();
+            
+            // Close WebSocket
+            if (ws) ws.close();
+            
+            // End session on backend
+            if (sessionId) {
+                try {
+                    await fetch(`${API_BASE}/session/end/${sessionId}`, { method: "POST" });
+                } catch (e) { console.error("Error ending session", e); }
+            }
+            
+            // Reset UI
+            videoElement.srcObject = null;
+            document.getElementById('btn-start').disabled = false;
+            updateAgentState("IDLE");
+            document.getElementById('emotion-text').innerText = "Session Ended";
+            document.getElementById('emotion-color').style.backgroundColor = "gray";
+            updateStatus("Session ended.", "info");
+            sessionId = null;
+        }
+
+        // --- Vision Pipeline ---
+
+        async function startWebcam() {
+            videoStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            videoElement.srcObject = videoStream;
+            // Wait for video to be ready before capturing frames
+            return new Promise(resolve => {
+                videoElement.onloadedmetadata = () => {
+                    videoElement.play();
+                    resolve();
+                };
+            });
+        }
+
+        function startFrameCapture() {
+            // Capture a frame every 3 seconds
+            frameInterval = setInterval(captureAndSendFrame, 3000);
+        }
+
+        function captureAndSendFrame() {
+            if (!videoElement.videoWidth) return;
+            
+            // Draw video to hidden canvas
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+            canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
+            
+            // Convert to JPEG blob and send
+            canvasElement.toBlob(async (blob) => {
+                try {
+                    const res = await fetch(`${API_BASE}/analyze-frame/${sessionId}`, {
+                        method: "POST",
+                        body: blob
+                    });
+                    const result = await res.json();
+                    updateEmotionBadge(result.emotion, result.attention);
+                } catch (e) {
+                    console.error("Frame analysis failed:", e);
+                }
+            }, "image/jpeg", 0.8);
+        }
+
+        function startContextPolling() {
+            // Poll for context updates (e.g. LLM transcript)
+            contextInterval = setInterval(async () => {
+                try {
+                    const res = await fetch(`${API_BASE}/transcript/${sessionId}`);
+                    const data = await res.json();
+                    renderTranscript(data.turns);
+                    document.getElementById('turn-count').innerText = data.turn_count;
+                } catch (e) {
+                    console.error("Transcript polling failed:", e);
+                }
+            }, 2000);
+        }
+
+        // --- Audio Pipeline ---
+
+        async function connectAudioWebSocket() {
+            return new Promise((resolve, reject) => {
+                ws = new WebSocket(`${WS_BASE}/ws/audio/${sessionId}`);
+                ws.binaryType = "arraybuffer";
+                
+                ws.onopen = async () => {
+                    await startMicCapture();
+                    resolve();
+                };
+                
+                ws.onerror = (err) => reject(err);
+                
+                ws.onmessage = (event) => {
+                    // Received TTS audio bytes from backend
+                    playAudioBytes(event.data);
+                };
+                
+                ws.onclose = () => {
+                    updateStatus("WebSocket disconnected.", "error");
+                    updateAgentState("IDLE");
+                };
+            });
+        }
+
+        async function startMicCapture() {
+            audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            
+            const source = audioContext.createMediaStreamSource(audioStream);
+            audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+            
+            audioProcessor.onaudioprocess = (e) => {
+                // If agent is speaking or thinking, don't send audio (simple half-duplex)
+                const state = document.getElementById('agent-state').innerText;
+                if (state === "SPEAKING" || state === "THINKING") return;
+                
+                const inputData = e.inputBuffer.getChannelData(0);
+                sendAudioChunk(inputData);
+            };
+            
+            source.connect(audioProcessor);
+            audioProcessor.connect(audioContext.destination);
+        }
+
+        function sendAudioChunk(float32Array) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                const pcm16 = float32ToPCM16(float32Array);
+                ws.send(pcm16.buffer);
+            }
+        }
+
+        function playAudioBytes(arrayBuffer) {
+            updateAgentState("SPEAKING");
+            
+            // Create blob (assuming WAV format from Sarvam or Groq fallback. Adjust to audio/mpeg if using gTTS exclusively)
+            // Using audio/wav covers Sarvam. For generic fallback we can try audio/mp3 if it fails, but browsers usually auto-detect.
+            // Sarvam is WAV, gTTS is MP3. Let's just use generic audio/wav or let browser infer.
+            const blob = new Blob([arrayBuffer], { type: 'audio/wav' }); 
+            const url = URL.createObjectURL(blob);
+            
+            audioElement.src = url;
+            audioElement.play().catch(e => console.error("Audio play error:", e));
+            
+            audioElement.onended = () => {
+                URL.revokeObjectURL(url);
+                updateAgentState("LISTENING");
+                // Immediately update transcript after speaking to ensure UI is fresh
+                fetch(`${API_BASE}/transcript/${sessionId}`)
+                    .then(r => r.json())
+                    .then(d => renderTranscript(d.turns));
+            };
+        }
+
+        // --- Utils & UI Updates ---
+
+        function updateEmotionBadge(emotion, attention) {
+            const color = EMOTION_COLORS[emotion] || EMOTION_COLORS["unknown"];
+            document.getElementById('emotion-color').style.backgroundColor = color;
+            document.getElementById('emotion-text').innerText = `${emotion} · ${attention}`;
+        }
+
+        function updateAgentState(state) {
+            const el = document.getElementById('agent-state');
+            el.innerText = state;
+            el.className = state.toLowerCase();
+        }
+
+        function updateStatus(msg, type) {
+            statusMsg.innerText = msg;
+            statusMsg.className = `status-text ${type}`;
+        }
+
+        function renderTranscript(turns) {
+            // Only re-render if count changed
+            const currentMsgCount = transcriptDiv.querySelectorAll('.message').length;
+            if (turns.length === currentMsgCount) return;
+            
+            transcriptDiv.innerHTML = "";
+            turns.forEach(turn => {
+                const div = document.createElement('div');
+                div.className = `message ${turn.role}`;
+                div.innerText = turn.content;
+                transcriptDiv.appendChild(div);
+            });
+            
+            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+        }
+
+        function float32ToPCM16(float32Array) {
+            const pcm16 = new Int16Array(float32Array.length);
+            for (let i = 0; i < float32Array.length; i++) {
+                const s = Math.max(-1, Math.min(1, float32Array[i]));
+                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+            }
+            return pcm16;
+        }
+
+        // Add a manual listener for typing state (if we wanted to add a text input fallback)
+        // But the blueprint is purely voice, so we rely on STT triggering the THINKING state.
+        // We can hook into the ws.send to temporarily show THINKING if we want a more responsive UI.
+        
+        // Minor patch: When user stops speaking, it takes a moment to process.
+        // A full robust implementation would have the server send a WebSocket JSON message `{"type": "status", "state": "THINKING"}`
+        // before running the LLM. For now, since audio just arrives, it flips from LISTENING directly to SPEAKING.
+        
+    </script>
+</body>
+</html>
