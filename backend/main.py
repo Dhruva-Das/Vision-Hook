@@ -51,7 +51,8 @@ async def process_frame(session_id: str, request: Request):
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Empty frame body")
         
-    result = analyze_frame(image_bytes)
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, analyze_frame, image_bytes)
     
     # Store it so the AgentPipeline can read it on the next turn
     await context_store.update(session_id, result)

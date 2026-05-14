@@ -38,7 +38,7 @@ class GroqWhisperSTT:
                 wf.writeframes(audio_bytes)
                 
             # Groq SDK is synchronous, so we run it in an executor
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             
             def _do_transcribe():
                 with open(tmp_path, "rb") as f:
@@ -86,7 +86,7 @@ class LocalWhisperSTT:
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio_bytes)
                 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             
             def _do_transcribe():
                 segments, _ = self.model.transcribe(tmp_path, beam_size=5, language="en")

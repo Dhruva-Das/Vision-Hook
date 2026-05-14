@@ -74,7 +74,7 @@ class gTTSTTS:
         if not text:
             return b""
             
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         
         def _do_synthesize():
             tts = gTTS(text=text, lang=self.language, slow=False)

@@ -175,6 +175,13 @@
         let audioContext = null;
         let audioProcessor = null;
         
+        // VAD (Voice Activity Detection) State
+        let pcmBuffer = [];
+        let isSpeaking = false;
+        let silenceCount = 0;
+        const VOLUME_THRESHOLD = 0.015;
+        const SILENCE_LIMIT = 5; // approx 1.25 seconds of silence
+        
         // Intervals
         let frameInterval = null;
         let contextInterval = null;
@@ -334,7 +341,10 @@
                 ws.onerror = (err) => reject(err);
                 
                 ws.onmessage = (event) => {
-                    // Received TTS audio bytes from backend
+                    if (event.data.byteLength === 0) {
+                        updateAgentState("LISTENING");
+                        return;
+                    }
                     playAudioBytes(event.data);
                 };
                 
@@ -353,21 +363,54 @@
             audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
             
             audioProcessor.onaudioprocess = (e) => {
-                // If agent is speaking or thinking, don't send audio (simple half-duplex)
                 const state = document.getElementById('agent-state').innerText;
-                if (state === "SPEAKING" || state === "THINKING") return;
+                // Only listen if agent is in LISTENING state
+                if (state !== "LISTENING") {
+                    if (pcmBuffer.length > 0) pcmBuffer = [];
+                    return;
+                }
                 
                 const inputData = e.inputBuffer.getChannelData(0);
-                sendAudioChunk(inputData);
+                
+                let sum = 0;
+                for (let i = 0; i < inputData.length; i++) {
+                    sum += Math.abs(inputData[i]);
+                }
+                let volume = sum / inputData.length;
+                
+                if (volume > VOLUME_THRESHOLD) {
+                    isSpeaking = true;
+                    silenceCount = 0;
+                    pcmBuffer.push(new Float32Array(inputData));
+                } else {
+                    if (isSpeaking) {
+                        silenceCount++;
+                        pcmBuffer.push(new Float32Array(inputData));
+                        if (silenceCount > SILENCE_LIMIT) {
+                            sendBufferedAudio(pcmBuffer);
+                            pcmBuffer = [];
+                            isSpeaking = false;
+                            silenceCount = 0;
+                        }
+                    }
+                }
             };
             
             source.connect(audioProcessor);
             audioProcessor.connect(audioContext.destination);
         }
 
-        function sendAudioChunk(float32Array) {
+        function sendBufferedAudio(buffers) {
             if (ws && ws.readyState === WebSocket.OPEN) {
-                const pcm16 = float32ToPCM16(float32Array);
+                let totalLength = buffers.reduce((acc, b) => acc + b.length, 0);
+                let flatBuffer = new Float32Array(totalLength);
+                let offset = 0;
+                for (let b of buffers) {
+                    flatBuffer.set(b, offset);
+                    offset += b.length;
+                }
+                const pcm16 = float32ToPCM16(flatBuffer);
+                updateAgentState("THINKING");
                 ws.send(pcm16.buffer);
             }
         }
@@ -375,14 +418,15 @@
         function playAudioBytes(arrayBuffer) {
             updateAgentState("SPEAKING");
             
-            // Create blob (assuming WAV format from Sarvam or Groq fallback. Adjust to audio/mpeg if using gTTS exclusively)
-            // Using audio/wav covers Sarvam. For generic fallback we can try audio/mp3 if it fails, but browsers usually auto-detect.
-            // Sarvam is WAV, gTTS is MP3. Let's just use generic audio/wav or let browser infer.
-            const blob = new Blob([arrayBuffer], { type: 'audio/wav' }); 
+            // Let the browser infer the audio format natively
+            const blob = new Blob([arrayBuffer]); 
             const url = URL.createObjectURL(blob);
             
             audioElement.src = url;
-            audioElement.play().catch(e => console.error("Audio play error:", e));
+            audioElement.play().catch(e => {
+                console.error("Audio play error:", e);
+                updateAgentState("LISTENING");
+            });
             
             audioElement.onended = () => {
                 URL.revokeObjectURL(url);
@@ -437,15 +481,6 @@
             }
             return pcm16;
         }
-
-        // Add a manual listener for typing state (if we wanted to add a text input fallback)
-        // But the blueprint is purely voice, so we rely on STT triggering the THINKING state.
-        // We can hook into the ws.send to temporarily show THINKING if we want a more responsive UI.
-        
-        // Minor patch: When user stops speaking, it takes a moment to process.
-        // A full robust implementation would have the server send a WebSocket JSON message `{"type": "status", "state": "THINKING"}`
-        // before running the LLM. For now, since audio just arrives, it flips from LISTENING directly to SPEAKING.
-        
     </script>
 </body>
 </html>
