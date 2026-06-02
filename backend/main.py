@@ -17,7 +17,10 @@ from backend.config import (
 )
 from backend.vision.frame_analyzer import analyze_frame
 from backend.vision.context_store import context_store
-from backend.agent.pipeline import get_pipeline, destroy_pipeline, get_all_session_ids
+from backend.agent.pipeline import (
+    get_pipeline, destroy_pipeline, get_all_session_ids,
+    pipeline_exists, cleanup_stale_pipelines,
+)
 
 # Configure basic logging
 logging.basicConfig(
@@ -33,11 +36,27 @@ load_config()
 limiter = Limiter(key_func=get_remote_address, default_limits=[RATE_LIMIT])
 
 
+async def _session_gc_task():
+    """Background task: evict pipelines idle longer than SESSION_TTL_SECONDS."""
+    while True:
+        await asyncio.sleep(300)  # check every 5 minutes
+        removed = cleanup_stale_pipelines()
+        if removed:
+            logger.info(f"Session GC: evicted {removed} idle session(s)")
+
+
 # --- Lifespan (startup / shutdown) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    gc_task = asyncio.create_task(_session_gc_task())
     logger.info("Vision Voice Agent starting up")
     yield
+    # Cancel GC task
+    gc_task.cancel()
+    try:
+        await gc_task
+    except asyncio.CancelledError:
+        pass
     # Shutdown: clean up every active pipeline and context
     logger.info("Shutting down — cleaning up active sessions")
     for sid in get_all_session_ids():
@@ -71,16 +90,13 @@ app.add_middleware(
 
 
 # --- Auth Middleware ---
-# Skipped paths that don't require auth
 _PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
 
 @app.middleware("http")
 async def api_key_middleware(request: Request, call_next):
-    # If no API_KEY configured, auth is disabled (dev mode)
     if not API_KEY:
         return await call_next(request)
 
-    # Allow public endpoints through without auth
     if request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
@@ -110,6 +126,10 @@ async def process_frame(session_id: str, request: Request):
     Receives raw JPEG/PNG bytes in the request body.
     Runs FER and updates the shared context store.
     """
+    # Issue 7: guard against frames arriving for sessions that no longer exist
+    if not pipeline_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
     image_bytes = await request.body()
 
     if not image_bytes:
@@ -124,7 +144,6 @@ async def process_frame(session_id: str, request: Request):
     loop = asyncio.get_running_loop()
     result = await loop.run_in_executor(None, analyze_frame, image_bytes)
 
-    # Store it so the AgentPipeline can read it on the next turn
     await context_store.update(session_id, result)
 
     return {
@@ -140,28 +159,33 @@ async def websocket_audio_endpoint(websocket: WebSocket, session_id: str):
     """
     Persistent WebSocket for the audio stream.
     Receives audio chunks, passes them to the pipeline, and sends TTS audio back.
+
+    Issue 1: API key is validated via the first text message sent by the client
+    ({"type": "auth", "key": "<api_key>"}), not via a URL query parameter.
+    This keeps the key out of server access logs and browser history.
     """
-    # Verify API key for WebSocket via query param (headers aren't reliable for WS)
+    await websocket.accept()
+
     if API_KEY:
-        ws_key = websocket.query_params.get("api_key", "")
-        if ws_key != API_KEY:
-            await websocket.close(code=4401, reason="Invalid or missing API key")
+        try:
+            auth_msg = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+            if auth_msg.get("type") != "auth" or auth_msg.get("key") != API_KEY:
+                await websocket.close(code=4401, reason="Invalid or missing API key")
+                return
+        except asyncio.TimeoutError:
+            await websocket.close(code=4401, reason="Auth timeout")
+            return
+        except Exception:
+            await websocket.close(code=4401, reason="Auth error")
             return
 
-    await websocket.accept()
     pipeline = get_pipeline(session_id)
-
     logger.info(f"WebSocket connected for session: {session_id}")
 
     try:
         while True:
-            # Receive raw PCM/WAV bytes from the browser microphone
             audio_bytes = await websocket.receive_bytes()
-
-            # Process the turn (STT -> Context Inject -> LLM -> TTS)
             tts_audio = await pipeline.process_audio(audio_bytes)
-
-            # If the LLM spoke, send the synthesized audio bytes back to the browser
             if tts_audio:
                 await websocket.send_bytes(tts_audio)
 
@@ -174,7 +198,6 @@ async def websocket_audio_endpoint(websocket: WebSocket, session_id: str):
         except Exception:
             pass
     finally:
-        # Clean up pipeline and context when the WebSocket closes
         destroy_pipeline(session_id)
         await context_store.clear(session_id)
 
@@ -193,6 +216,10 @@ async def get_context(request: Request, session_id: str) -> Dict[str, Any]:
 @limiter.limit(RATE_LIMIT)
 async def get_transcript(request: Request, session_id: str) -> Dict[str, Any]:
     """Returns the conversation history and turn count."""
+    # Issue 7: get_pipeline silently creates a new empty pipeline if the session
+    # doesn't exist, so we must check first to avoid returning a ghost transcript.
+    if not pipeline_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
     pipeline = get_pipeline(session_id)
     return {
         "turns": pipeline.get_transcript(),
@@ -204,6 +231,9 @@ async def get_transcript(request: Request, session_id: str) -> Dict[str, Any]:
 @limiter.limit(RATE_LIMIT)
 async def end_session(request: Request, session_id: str):
     """Cleans up the pipeline and context store, returns final transcript."""
+    if not pipeline_exists(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+
     pipeline = get_pipeline(session_id)
     transcript = pipeline.get_transcript()
 

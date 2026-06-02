@@ -1,7 +1,9 @@
+import asyncio
 import logging
+import time
 from typing import List, Dict
 
-from backend.config import BASE_SYSTEM_PROMPT
+from backend.config import BASE_SYSTEM_PROMPT, SESSION_TTL_SECONDS
 from backend.audio.stt import get_stt_provider
 from backend.audio.tts import get_tts_provider
 from backend.agent.llm import GroqLLMClient
@@ -10,6 +12,9 @@ from backend.vision.context_store import context_store
 
 # Max conversation turns to keep in history (user + assistant = 1 turn)
 MAX_HISTORY_TURNS = 50
+
+# Timeout for a single LLM generation call
+LLM_TIMEOUT_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +39,12 @@ class AgentPipeline:
         """
         if not audio_bytes:
             return b""
-            
+
         transcript = await self.stt.transcribe(audio_bytes)
-        
-        # If no speech was detected or transcription failed
+
         if not transcript or not transcript.strip():
             return b""
-            
+
         logger.info(f"[{self.session_id}] STT Transcript: {transcript}")
         return await self._process_turn(transcript)
 
@@ -48,77 +52,97 @@ class AgentPipeline:
         """
         The core pipeline logic.
         1. Inject visual context
-        2. Query LLM
+        2. Query LLM (with timeout)
         3. Convert response to Speech
         """
-        # Step 1: Record user message
         self.conversation_history.append({"role": "user", "content": user_text})
-        
-        # Step 2: Retrieve the latest visual context
+
         context = await context_store.get_or_default(self.session_id)
         is_stale = await context_store.is_stale(self.session_id)
-        
-        # Step 3: Build the enriched system prompt
+
         system_prompt = build_system_prompt(BASE_SYSTEM_PROMPT, context, is_stale)
-        
-        # Log clean system prompt (without the massive visual block) to keep logs readable
-        clean_prompt = strip_visual_context(system_prompt)
         logger.debug(f"[{self.session_id}] System prompt generated (visuals injected)")
-        
-        # Step 4: Generate LLM response
-        response_text = await self.llm.generate(self.conversation_history, system_prompt)
+
+        # Issue 3: Enforce a hard timeout on the LLM call so a hung Groq request
+        # cannot block the WebSocket indefinitely.
+        try:
+            response_text = await asyncio.wait_for(
+                self.llm.generate(self.conversation_history, system_prompt),
+                timeout=LLM_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[{self.session_id}] LLM timed out after {LLM_TIMEOUT_SECONDS}s")
+            response_text = "I'm taking a moment to think. Could you repeat that?"
+
         logger.info(f"[{self.session_id}] LLM Response: {response_text}")
-        
-        # Step 5: Record assistant message
         self.conversation_history.append({"role": "assistant", "content": response_text})
-        
-        # Step 6: Synthesize Speech
+
         try:
             audio_bytes = await self.tts.synthesize(response_text)
         except Exception as e:
             logger.error(f"[{self.session_id}] TTS failed: {e}")
-            # Even if TTS fails, we return empty bytes so the pipeline doesn't crash the websocket
             audio_bytes = b""
-            
-        # Step 7: Update state
+
         self.turn_count += 1
 
-        # Trim history to avoid exceeding LLM context window
-        max_messages = MAX_HISTORY_TURNS * 2  # each turn is user + assistant
+        max_messages = MAX_HISTORY_TURNS * 2
         if len(self.conversation_history) > max_messages:
             self.conversation_history = self.conversation_history[-max_messages:]
 
         return audio_bytes
 
     def get_transcript(self) -> List[Dict[str, str]]:
-        """Returns the conversation history."""
         return self.conversation_history
 
     def get_turn_count(self) -> int:
-        """Returns the number of completed turns."""
         return self.turn_count
 
     def reset(self) -> None:
-        """Clears the history and resets the turn count."""
         self.conversation_history = []
         self.turn_count = 0
         logger.info(f"Pipeline reset for session {self.session_id}")
 
 
-# Module-level registry to hold active pipelines
+# Module-level registry with last-active timestamps for TTL-based GC (Issue 2)
 _pipelines: Dict[str, AgentPipeline] = {}
+_pipeline_last_active: Dict[str, float] = {}
+
+
+def pipeline_exists(session_id: str) -> bool:
+    """Returns True if a live pipeline exists for this session."""
+    return session_id in _pipelines
+
 
 def get_pipeline(session_id: str) -> AgentPipeline:
     """Retrieves an existing pipeline or creates a new one for the session."""
     if session_id not in _pipelines:
         _pipelines[session_id] = AgentPipeline(session_id)
+    _pipeline_last_active[session_id] = time.monotonic()
     return _pipelines[session_id]
+
 
 def destroy_pipeline(session_id: str) -> None:
     """Removes a pipeline from memory."""
-    if session_id in _pipelines:
-        del _pipelines[session_id]
-        logger.info(f"Destroyed pipeline for session {session_id}")
+    _pipelines.pop(session_id, None)
+    _pipeline_last_active.pop(session_id, None)
+    logger.info(f"Destroyed pipeline for session {session_id}")
+
+
+def cleanup_stale_pipelines() -> int:
+    """
+    Evicts pipelines that have been idle longer than SESSION_TTL_SECONDS.
+    Called periodically by the GC background task in main.py.
+    Returns the number of sessions removed.
+    """
+    now = time.monotonic()
+    stale = [
+        sid for sid, last in list(_pipeline_last_active.items())
+        if now - last > SESSION_TTL_SECONDS
+    ]
+    for sid in stale:
+        destroy_pipeline(sid)
+        logger.info(f"GC: evicted idle session {sid}")
+    return len(stale)
 
 
 def get_all_session_ids() -> list[str]:

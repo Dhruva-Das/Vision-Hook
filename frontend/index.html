@@ -186,6 +186,7 @@
         let audioStream = null;
         let audioContext = null;
         let workletNode = null;
+        let micSetupDone = false;
 
         // VAD (Voice Activity Detection) State
         let pcmBuffer = [];
@@ -193,6 +194,10 @@
         let silenceCount = 0;
         const VOLUME_THRESHOLD = 0.015;
         const SILENCE_LIMIT = 5; // approx 1.25 seconds of silence
+
+        // Reconnect state
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 5;
 
         // Intervals
         let frameInterval = null;
@@ -266,14 +271,19 @@
             if (audioStream) audioStream.getTracks().forEach(t => t.stop());
             if (workletNode) { workletNode.disconnect(); workletNode = null; }
             if (audioContext) { await audioContext.close(); audioContext = null; }
+            micSetupDone = false;
 
-            // Close WebSocket
-            if (ws) ws.close();
+            // Null sessionId BEFORE closing the WebSocket so the onclose handler
+            // knows this is an intentional teardown and skips the reconnect logic.
+            const _sessionId = sessionId;
+            sessionId = null;
+            reconnectAttempts = 0;
+            if (ws) { ws.close(); ws = null; }
 
             // End session on backend
-            if (sessionId) {
+            if (_sessionId) {
                 try {
-                    await fetch(`${API_BASE}/session/end/${sessionId}`, {
+                    await fetch(`${API_BASE}/session/end/${_sessionId}`, {
                         method: "POST",
                         headers: apiHeaders(),
                     });
@@ -287,7 +297,6 @@
             document.getElementById('emotion-text').innerText = "Session Ended";
             document.getElementById('emotion-color').style.backgroundColor = "gray";
             updateStatus("Session ended.", "info");
-            sessionId = null;
         }
 
         // --- Vision Pipeline ---
@@ -412,19 +421,29 @@ registerProcessor("pcm-capture-processor", PCMCaptureProcessor);
 
         async function connectAudioWebSocket() {
             return new Promise((resolve, reject) => {
-                const wsUrl = API_KEY
-                    ? `${WS_BASE}/ws/audio/${sessionId}?api_key=${encodeURIComponent(API_KEY)}`
-                    : `${WS_BASE}/ws/audio/${sessionId}`;
-
+                // Issue 1: API key is sent as the first WebSocket message, not in the
+                // URL query string, so it never appears in server access logs or browser history.
+                const wsUrl = `${WS_BASE}/ws/audio/${sessionId}`;
                 ws = new WebSocket(wsUrl);
                 ws.binaryType = "arraybuffer";
 
                 ws.onopen = async () => {
-                    await startMicCapture();
+                    // Send auth handshake before any audio
+                    if (API_KEY) {
+                        ws.send(JSON.stringify({ type: "auth", key: API_KEY }));
+                    }
+                    // Only set up the AudioWorklet once; reuse on reconnects
+                    if (!micSetupDone) {
+                        await startMicCapture();
+                        micSetupDone = true;
+                    }
+                    reconnectAttempts = 0;
                     resolve();
                 };
 
-                ws.onerror = (err) => reject(err);
+                ws.onerror = (err) => {
+                    if (reconnectAttempts === 0) reject(err);
+                };
 
                 ws.onmessage = (event) => {
                     if (event.data.byteLength === 0) {
@@ -434,9 +453,36 @@ registerProcessor("pcm-capture-processor", PCMCaptureProcessor);
                     playAudioBytes(event.data);
                 };
 
-                ws.onclose = () => {
-                    updateStatus("WebSocket disconnected.", "error");
+                // Issue 6: Reconnect with exponential backoff on unexpected disconnects.
+                ws.onclose = async () => {
                     updateAgentState("IDLE");
+                    // sessionId is nulled before ws.close() in endSession(),
+                    // so a falsy sessionId here means the user ended the session intentionally.
+                    if (!sessionId) return;
+
+                    if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                        updateStatus("Connection lost. Please restart the session.", "error");
+                        return;
+                    }
+
+                    reconnectAttempts++;
+                    const delayMs = Math.min(1000 * Math.pow(2, reconnectAttempts - 1), 30000);
+                    updateStatus(
+                        `Connection lost. Reconnecting in ${Math.round(delayMs / 1000)}s… ` +
+                        `(attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`,
+                        "error"
+                    );
+
+                    setTimeout(async () => {
+                        if (!sessionId) return; // session ended while waiting
+                        try {
+                            await connectAudioWebSocket();
+                            updateStatus("Reconnected. Session active.", "success");
+                            updateAgentState("LISTENING");
+                        } catch (e) {
+                            console.error("Reconnect failed:", e);
+                        }
+                    }, delayMs);
                 };
             });
         }

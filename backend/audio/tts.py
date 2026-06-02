@@ -23,7 +23,7 @@ class SarvamTTS:
     async def synthesize(self, text: str) -> bytes:
         if not text:
             return b""
-            
+
         payload = {
             "inputs": [text],
             "target_language_code": "en-IN",
@@ -35,34 +35,40 @@ class SarvamTTS:
             "enable_preprocessing": True,
             "model": "bulbul:v1"
         }
-        
+
         headers = {
-            "api-subscription-key": self.api_key, 
+            "api-subscription-key": self.api_key,
             "Content-Type": "application/json"
         }
-        
-        async with httpx.AsyncClient() as client:
+
+        # Retry once on transient network/API errors
+        for attempt in range(2):
             try:
-                response = await client.post(
-                    self.base_url, 
-                    json=payload, 
-                    headers=headers,
-                    timeout=30.0
-                )
-                response.raise_for_status()
-                response_json = response.json()
-                
-                if "audios" in response_json and len(response_json["audios"]) > 0:
-                    base64_audio = response_json["audios"][0]
-                    return base64.b64decode(base64_audio)
-                else:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        self.base_url,
+                        json=payload,
+                        headers=headers,
+                        timeout=30.0,
+                    )
+                    response.raise_for_status()
+                    response_json = response.json()
+
+                    if "audios" in response_json and len(response_json["audios"]) > 0:
+                        return base64.b64decode(response_json["audios"][0])
                     raise TTSError("Unexpected response format from Sarvam API")
-                    
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Sarvam API HTTP error: {e.response.status_code} - {e.response.text}")
-                raise TTSError(f"Sarvam API error: {e.response.status_code}")
+
+            except TTSError:
+                raise
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                if attempt == 0:
+                    logger.warning(f"Sarvam TTS error on attempt 1, retrying in 1s: {e}")
+                    await asyncio.sleep(1.0)
+                    continue
+                logger.error(f"Sarvam API error: {e}")
+                raise TTSError(f"Sarvam API error: {e}")
             except Exception as e:
-                logger.error(f"Error during Sarvam TTS synthesis: {e}")
+                logger.error(f"Unexpected error during Sarvam TTS synthesis: {e}")
                 raise TTSError(f"Error during Sarvam TTS synthesis: {e}")
 
 

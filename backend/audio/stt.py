@@ -36,10 +36,10 @@ class GroqWhisperSTT:
                 wf.setsampwidth(2) # 16-bit
                 wf.setframerate(sample_rate)
                 wf.writeframes(audio_bytes)
-                
+
             # Groq SDK is synchronous, so we run it in an executor
             loop = asyncio.get_running_loop()
-            
+
             def _do_transcribe():
                 with open(tmp_path, "rb") as f:
                     return self.client.audio.transcriptions.create(
@@ -48,13 +48,20 @@ class GroqWhisperSTT:
                         response_format="text",
                         language="en"
                     )
-                    
-            transcription = await loop.run_in_executor(None, _do_transcribe)
-            return transcription.strip()
-            
-        except APIError as e:
-            logger.error(f"Groq API Error during STT: {e}")
-            return ""
+
+            # Retry once on transient API errors
+            for attempt in range(2):
+                try:
+                    transcription = await loop.run_in_executor(None, _do_transcribe)
+                    return transcription.strip()
+                except APIError as e:
+                    if attempt == 0:
+                        logger.warning(f"Groq STT error on attempt 1, retrying in 1s: {e}")
+                        await asyncio.sleep(1.0)
+                        continue
+                    logger.error(f"Groq API Error during STT: {e}")
+                    return ""
+
         except Exception as e:
             logger.error(f"Error during STT transcription: {e}")
             return ""

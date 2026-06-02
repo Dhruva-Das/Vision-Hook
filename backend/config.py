@@ -16,6 +16,10 @@ TTS_PROVIDER: str = os.getenv("TTS_PROVIDER", "sarvam")
 FRAME_ANALYSIS_INTERVAL: int = int(os.getenv("FRAME_ANALYSIS_INTERVAL", "3"))
 LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
+LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+
+# Session idle TTL before garbage collection (seconds)
+SESSION_TTL_SECONDS: int = int(os.getenv("SESSION_TTL_SECONDS", str(30 * 60)))
 
 # Auth — set to empty string to disable API key checking (dev mode)
 API_KEY: str = os.getenv("API_KEY", "")
