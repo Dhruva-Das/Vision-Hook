@@ -1,24 +1,29 @@
 # Server
-fastapi==0.115.0
-uvicorn[standard]==0.30.0
-python-dotenv==1.0.0
-python-multipart==0.0.9
-websockets==12.0
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.9
+websockets>=12.0
+slowapi>=0.1.9
 
 # LLM + STT — ONE key handles both
-groq==0.9.0
+groq>=0.9.0
 
 # TTS options — install both, config picks one at runtime
-gTTS==2.5.1                 # zero cost, no key
+gTTS>=2.5.1                 # zero cost, no key
 
 # Vision — fully local, no API
-opencv-python==4.10.0.84
-fer==22.5.1                 # FER2013-based emotion recognition
-numpy==1.26.4
-tensorflow==2.17.0          # FER dependency (heavy but required)
+opencv-python>=4.10.0.84
+fer>=22.5.1                 # FER2013-based emotion recognition
+numpy>=1.26.4
+tensorflow>=2.17.0          # FER dependency
 
 # STT local fallback (optional — only needed if STT_PROVIDER=local)
-faster-whisper==1.0.3
+# faster-whisper>=1.0.3
 
 # HTTP client for Sarvam TTS
-httpx==0.27.0
+httpx>=0.27.0
+
+# Testing
+pytest>=8.3.2
+pytest-asyncio>=0.24.0

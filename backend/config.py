@@ -17,6 +17,18 @@ FRAME_ANALYSIS_INTERVAL: int = int(os.getenv("FRAME_ANALYSIS_INTERVAL", "3"))
 LLM_MODEL: str = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 
+# Auth — set to empty string to disable API key checking (dev mode)
+API_KEY: str = os.getenv("API_KEY", "")
+
+# Rate limiting
+RATE_LIMIT: str = os.getenv("RATE_LIMIT", "60/minute")
+
+# Request size limits (bytes)
+MAX_FRAME_SIZE: int = int(os.getenv("MAX_FRAME_SIZE", str(5 * 1024 * 1024)))  # 5 MB
+
+# Allowed CORS origins — comma-separated, or "*" for dev
+CORS_ORIGINS: str = os.getenv("CORS_ORIGINS", "*")
+
 BASE_SYSTEM_PROMPT: str = """You are a helpful and perceptive AI assistant. 
 You answer questions clearly and concisely. 
 You are speaking directly to a user through a voice interface."""

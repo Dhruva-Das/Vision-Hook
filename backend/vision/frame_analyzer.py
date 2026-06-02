@@ -2,7 +2,10 @@ import cv2
 import numpy as np
 import logging
 from datetime import datetime, timezone
-from fer import FER
+try:
+    from fer import FER
+except ImportError:
+    from fer.fer import FER
 
 logger = logging.getLogger(__name__)
 

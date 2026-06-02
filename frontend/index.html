@@ -19,7 +19,7 @@
         }
 
         * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
-        
+
         body {
             margin: 0; padding: 20px;
             background-color: var(--bg-color); color: var(--text-main);
@@ -54,7 +54,7 @@
             padding: 6px 12px; border-radius: 20px; font-size: 0.875rem; font-weight: 500;
             display: flex; align-items: center; gap: 6px;
         }
-        
+
         .indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; background-color: gray; }
 
         /* Agent State */
@@ -98,12 +98,12 @@
             display: flex; justify-content: space-between; color: var(--text-muted);
             box-shadow: 0 1px 3px rgba(0,0,0,0.1);
         }
-        
+
         .status-text.error { color: var(--danger); }
         .status-text.success { color: var(--success); }
 
         canvas { display: none; }
-        
+
         @media (max-width: 768px) {
             .container { grid-template-columns: 1fr; }
         }
@@ -122,7 +122,7 @@
                     <span id="emotion-text">Connecting...</span>
                 </div>
             </div>
-            
+
             <div style="margin-top: 20px;">
                 <p style="font-size: 0.875rem; color: var(--text-muted);">
                     The agent analyzes your expression every 3 seconds and adapts its responses to your state.
@@ -141,14 +141,14 @@
                 <h2>Conversation</h2>
                 <div id="agent-state">IDLE</div>
             </div>
-            
+
             <div id="transcript">
                 <!-- Messages will appear here -->
                 <div style="text-align: center; color: var(--text-muted); margin-top: auto; margin-bottom: auto;">
                     Start a session to begin speaking.
                 </div>
             </div>
-            
+
             <audio id="audio-player" style="display: none;"></audio>
         </div>
     </div>
@@ -162,26 +162,38 @@
     <canvas id="hidden-canvas"></canvas>
 
     <script>
-        const API_BASE = "http://localhost:8000";
-        const WS_BASE = "ws://localhost:8000";
+        // --- Configuration ---
+        // Auto-detect API base from the page URL, or override via global config
+        const _loc = window.location;
+        const _apiPort = window.VISION_HOOK_API_PORT || "8000";
+        const API_BASE = window.VISION_HOOK_API_BASE || `${_loc.protocol}//${_loc.hostname}:${_apiPort}`;
+        const WS_BASE = window.VISION_HOOK_WS_BASE || `${_loc.protocol === "https:" ? "wss:" : "ws:"}//${_loc.hostname}:${_apiPort}`;
+        const API_KEY = window.VISION_HOOK_API_KEY || "";
+
+        // Headers helper
+        function apiHeaders(extra = {}) {
+            const h = { ...extra };
+            if (API_KEY) h["X-API-Key"] = API_KEY;
+            return h;
+        }
 
         // State
         let sessionId = null;
         let ws = null;
-        
+
         // Media streams
         let videoStream = null;
         let audioStream = null;
         let audioContext = null;
-        let audioProcessor = null;
-        
+        let workletNode = null;
+
         // VAD (Voice Activity Detection) State
         let pcmBuffer = [];
         let isSpeaking = false;
         let silenceCount = 0;
         const VOLUME_THRESHOLD = 0.015;
         const SILENCE_LIMIT = 5; // approx 1.25 seconds of silence
-        
+
         // Intervals
         let frameInterval = null;
         let contextInterval = null;
@@ -193,7 +205,7 @@
         const canvasCtx = canvasElement.getContext('2d');
         const transcriptDiv = document.getElementById('transcript');
         const statusMsg = document.getElementById('status-msg');
-        
+
         // Emotion Colors
         const EMOTION_COLORS = {
             "happy": "#10b981", "neutral": "#10b981",
@@ -209,27 +221,31 @@
             try {
                 updateStatus("Initializing session...", "info");
                 document.getElementById('btn-start').disabled = true;
-                
+
                 // 1. Create session on backend
-                const res = await fetch(`${API_BASE}/session/start`, { method: "POST" });
+                const res = await fetch(`${API_BASE}/session/start`, {
+                    method: "POST",
+                    headers: apiHeaders(),
+                });
+                if (!res.ok) throw new Error(`Server returned ${res.status}`);
                 const data = await res.json();
                 sessionId = data.session_id;
                 document.getElementById('session-id-display').innerText = sessionId.substring(0, 8) + "...";
-                
+
                 // 2. Start hardware
                 await startWebcam();
                 await connectAudioWebSocket();
-                
+
                 // 3. Start polling
                 startFrameCapture();
                 startContextPolling();
-                
+
                 // Update UI
                 document.getElementById('btn-end').disabled = false;
                 transcriptDiv.innerHTML = "";
                 updateAgentState("LISTENING");
                 updateStatus("Session active. Speak into your microphone.", "success");
-                
+
             } catch (err) {
                 console.error(err);
                 updateStatus("Failed to start session: " + err.message, "error");
@@ -240,26 +256,30 @@
         async function endSession() {
             updateStatus("Ending session...", "info");
             document.getElementById('btn-end').disabled = true;
-            
+
             // Stop intervals
             clearInterval(frameInterval);
             clearInterval(contextInterval);
-            
+
             // Stop hardware
             if (videoStream) videoStream.getTracks().forEach(t => t.stop());
             if (audioStream) audioStream.getTracks().forEach(t => t.stop());
-            if (audioContext) await audioContext.close();
-            
+            if (workletNode) { workletNode.disconnect(); workletNode = null; }
+            if (audioContext) { await audioContext.close(); audioContext = null; }
+
             // Close WebSocket
             if (ws) ws.close();
-            
+
             // End session on backend
             if (sessionId) {
                 try {
-                    await fetch(`${API_BASE}/session/end/${sessionId}`, { method: "POST" });
+                    await fetch(`${API_BASE}/session/end/${sessionId}`, {
+                        method: "POST",
+                        headers: apiHeaders(),
+                    });
                 } catch (e) { console.error("Error ending session", e); }
             }
-            
+
             // Reset UI
             videoElement.srcObject = null;
             document.getElementById('btn-start').disabled = false;
@@ -291,19 +311,21 @@
 
         function captureAndSendFrame() {
             if (!videoElement.videoWidth) return;
-            
+
             // Draw video to hidden canvas
             canvasElement.width = videoElement.videoWidth;
             canvasElement.height = videoElement.videoHeight;
             canvasCtx.drawImage(videoElement, 0, 0, canvasElement.width, canvasElement.height);
-            
+
             // Convert to JPEG blob and send
             canvasElement.toBlob(async (blob) => {
                 try {
                     const res = await fetch(`${API_BASE}/analyze-frame/${sessionId}`, {
                         method: "POST",
-                        body: blob
+                        headers: apiHeaders(),
+                        body: blob,
                     });
+                    if (!res.ok) throw new Error(`${res.status}`);
                     const result = await res.json();
                     updateEmotionBadge(result.emotion, result.attention);
                 } catch (e) {
@@ -316,7 +338,10 @@
             // Poll for context updates (e.g. LLM transcript)
             contextInterval = setInterval(async () => {
                 try {
-                    const res = await fetch(`${API_BASE}/transcript/${sessionId}`);
+                    const res = await fetch(`${API_BASE}/transcript/${sessionId}`, {
+                        headers: apiHeaders(),
+                    });
+                    if (!res.ok) return;
                     const data = await res.json();
                     renderTranscript(data.turns);
                     document.getElementById('turn-count').innerText = data.turn_count;
@@ -326,20 +351,81 @@
             }, 2000);
         }
 
-        // --- Audio Pipeline ---
+        // --- Audio Pipeline (AudioWorklet) ---
+
+        // Inline AudioWorklet processor code (avoids needing a separate file)
+        const WORKLET_CODE = `
+class PCMCaptureProcessor extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        this._buffer = [];
+        this._speaking = false;
+        this._silenceCount = 0;
+        this._volumeThreshold = 0.015;
+        this._silenceLimit = 5;
+    }
+
+    process(inputs) {
+        const input = inputs[0];
+        if (!input || !input[0]) return true;
+
+        const samples = input[0];
+        let sum = 0;
+        for (let i = 0; i < samples.length; i++) {
+            sum += Math.abs(samples[i]);
+        }
+        const volume = sum / samples.length;
+
+        if (volume > this._volumeThreshold) {
+            this._speaking = true;
+            this._silenceCount = 0;
+            this._buffer.push(new Float32Array(samples));
+        } else if (this._speaking) {
+            this._silenceCount++;
+            this._buffer.push(new Float32Array(samples));
+            if (this._silenceCount > this._silenceLimit) {
+                // Flatten and send
+                let totalLen = 0;
+                for (const b of this._buffer) totalLen += b.length;
+                const flat = new Float32Array(totalLen);
+                let off = 0;
+                for (const b of this._buffer) { flat.set(b, off); off += b.length; }
+
+                // Convert float32 to PCM16
+                const pcm16 = new Int16Array(flat.length);
+                for (let i = 0; i < flat.length; i++) {
+                    const s = Math.max(-1, Math.min(1, flat[i]));
+                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+                }
+
+                this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
+                this._buffer = [];
+                this._speaking = false;
+                this._silenceCount = 0;
+            }
+        }
+        return true;
+    }
+}
+registerProcessor("pcm-capture-processor", PCMCaptureProcessor);
+`;
 
         async function connectAudioWebSocket() {
             return new Promise((resolve, reject) => {
-                ws = new WebSocket(`${WS_BASE}/ws/audio/${sessionId}`);
+                const wsUrl = API_KEY
+                    ? `${WS_BASE}/ws/audio/${sessionId}?api_key=${encodeURIComponent(API_KEY)}`
+                    : `${WS_BASE}/ws/audio/${sessionId}`;
+
+                ws = new WebSocket(wsUrl);
                 ws.binaryType = "arraybuffer";
-                
+
                 ws.onopen = async () => {
                     await startMicCapture();
                     resolve();
                 };
-                
+
                 ws.onerror = (err) => reject(err);
-                
+
                 ws.onmessage = (event) => {
                     if (event.data.byteLength === 0) {
                         updateAgentState("LISTENING");
@@ -347,7 +433,7 @@
                     }
                     playAudioBytes(event.data);
                 };
-                
+
                 ws.onclose = () => {
                     updateStatus("WebSocket disconnected.", "error");
                     updateAgentState("IDLE");
@@ -358,92 +444,81 @@
         async function startMicCapture() {
             audioStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
             audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            
+
+            // Register the worklet processor from an inline blob
+            const blob = new Blob([WORKLET_CODE], { type: "application/javascript" });
+            const workletUrl = URL.createObjectURL(blob);
+            await audioContext.audioWorklet.addModule(workletUrl);
+            URL.revokeObjectURL(workletUrl);
+
             const source = audioContext.createMediaStreamSource(audioStream);
-            audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-            
-            audioProcessor.onaudioprocess = (e) => {
+            workletNode = new AudioWorkletNode(audioContext, "pcm-capture-processor");
+
+            workletNode.port.onmessage = (e) => {
                 const state = document.getElementById('agent-state').innerText;
-                // Only listen if agent is in LISTENING state
-                if (state !== "LISTENING") {
-                    if (pcmBuffer.length > 0) pcmBuffer = [];
-                    return;
-                }
-                
-                const inputData = e.inputBuffer.getChannelData(0);
-                
-                let sum = 0;
-                for (let i = 0; i < inputData.length; i++) {
-                    sum += Math.abs(inputData[i]);
-                }
-                let volume = sum / inputData.length;
-                
-                if (volume > VOLUME_THRESHOLD) {
-                    isSpeaking = true;
-                    silenceCount = 0;
-                    pcmBuffer.push(new Float32Array(inputData));
-                } else {
-                    if (isSpeaking) {
-                        silenceCount++;
-                        pcmBuffer.push(new Float32Array(inputData));
-                        if (silenceCount > SILENCE_LIMIT) {
-                            sendBufferedAudio(pcmBuffer);
-                            pcmBuffer = [];
-                            isSpeaking = false;
-                            silenceCount = 0;
-                        }
-                    }
+                if (state !== "LISTENING") return;
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    updateAgentState("THINKING");
+                    ws.send(e.data);
                 }
             };
-            
-            source.connect(audioProcessor);
-            audioProcessor.connect(audioContext.destination);
-        }
 
-        function sendBufferedAudio(buffers) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                let totalLength = buffers.reduce((acc, b) => acc + b.length, 0);
-                let flatBuffer = new Float32Array(totalLength);
-                let offset = 0;
-                for (let b of buffers) {
-                    flatBuffer.set(b, offset);
-                    offset += b.length;
-                }
-                const pcm16 = float32ToPCM16(flatBuffer);
-                updateAgentState("THINKING");
-                ws.send(pcm16.buffer);
-            }
+            source.connect(workletNode);
+            // AudioWorkletNode doesn't need to connect to destination for capture-only
+            workletNode.connect(audioContext.destination);
         }
 
         function playAudioBytes(arrayBuffer) {
             updateAgentState("SPEAKING");
-            
-            // Let the browser infer the audio format natively
-            const blob = new Blob([arrayBuffer]); 
+
+            // Detect MIME type from magic bytes for reliable cross-browser playback
+            const mimeType = detectAudioMime(arrayBuffer);
+            const blob = new Blob([arrayBuffer], { type: mimeType });
             const url = URL.createObjectURL(blob);
-            
+
             audioElement.src = url;
             audioElement.play().catch(e => {
                 console.error("Audio play error:", e);
                 updateAgentState("LISTENING");
             });
-            
+
             audioElement.onended = () => {
                 URL.revokeObjectURL(url);
                 updateAgentState("LISTENING");
                 // Immediately update transcript after speaking to ensure UI is fresh
-                fetch(`${API_BASE}/transcript/${sessionId}`)
+                fetch(`${API_BASE}/transcript/${sessionId}`, { headers: apiHeaders() })
                     .then(r => r.json())
-                    .then(d => renderTranscript(d.turns));
+                    .then(d => renderTranscript(d.turns))
+                    .catch(() => {});
             };
         }
 
-        // --- Utils & UI Updates ---
+        function detectAudioMime(buffer) {
+            const arr = new Uint8Array(buffer, 0, 12);
+            // WAV: starts with "RIFF"
+            if (arr[0] === 0x52 && arr[1] === 0x49 && arr[2] === 0x46 && arr[3] === 0x46) {
+                return "audio/wav";
+            }
+            // MP3: starts with ID3 tag or 0xFF 0xFB sync word
+            if ((arr[0] === 0x49 && arr[1] === 0x44 && arr[2] === 0x33) ||
+                (arr[0] === 0xFF && (arr[1] & 0xE0) === 0xE0)) {
+                return "audio/mpeg";
+            }
+            // OGG: starts with "OggS"
+            if (arr[0] === 0x4F && arr[1] === 0x67 && arr[2] === 0x67 && arr[3] === 0x53) {
+                return "audio/ogg";
+            }
+            // Fallback
+            return "audio/wav";
+        }
+
+        // --- UI Updates ---
 
         function updateEmotionBadge(emotion, attention) {
             const color = EMOTION_COLORS[emotion] || EMOTION_COLORS["unknown"];
             document.getElementById('emotion-color').style.backgroundColor = color;
-            document.getElementById('emotion-text').innerText = `${emotion} · ${attention}`;
+            document.getElementById('emotion-text').innerText = `${emotion} \u00b7 ${attention}`;
         }
 
         function updateAgentState(state) {
@@ -461,25 +536,16 @@
             // Only re-render if count changed
             const currentMsgCount = transcriptDiv.querySelectorAll('.message').length;
             if (turns.length === currentMsgCount) return;
-            
+
             transcriptDiv.innerHTML = "";
             turns.forEach(turn => {
                 const div = document.createElement('div');
                 div.className = `message ${turn.role}`;
-                div.innerText = turn.content;
+                div.textContent = turn.content;
                 transcriptDiv.appendChild(div);
             });
-            
-            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
-        }
 
-        function float32ToPCM16(float32Array) {
-            const pcm16 = new Int16Array(float32Array.length);
-            for (let i = 0; i < float32Array.length; i++) {
-                const s = Math.max(-1, Math.min(1, float32Array[i]));
-                pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-            }
-            return pcm16;
+            transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
         }
     </script>
 </body>

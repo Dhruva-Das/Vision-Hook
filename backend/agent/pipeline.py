@@ -8,6 +8,9 @@ from backend.agent.llm import GroqLLMClient
 from backend.agent.injector import build_system_prompt, strip_visual_context
 from backend.vision.context_store import context_store
 
+# Max conversation turns to keep in history (user + assistant = 1 turn)
+MAX_HISTORY_TURNS = 50
+
 logger = logging.getLogger(__name__)
 
 class AgentPipeline:
@@ -79,7 +82,12 @@ class AgentPipeline:
             
         # Step 7: Update state
         self.turn_count += 1
-        
+
+        # Trim history to avoid exceeding LLM context window
+        max_messages = MAX_HISTORY_TURNS * 2  # each turn is user + assistant
+        if len(self.conversation_history) > max_messages:
+            self.conversation_history = self.conversation_history[-max_messages:]
+
         return audio_bytes
 
     def get_transcript(self) -> List[Dict[str, str]]:
@@ -111,3 +119,8 @@ def destroy_pipeline(session_id: str) -> None:
     if session_id in _pipelines:
         del _pipelines[session_id]
         logger.info(f"Destroyed pipeline for session {session_id}")
+
+
+def get_all_session_ids() -> list[str]:
+    """Returns all active session IDs. Used for graceful shutdown cleanup."""
+    return list(_pipelines.keys())
